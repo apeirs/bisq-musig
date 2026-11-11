@@ -24,7 +24,7 @@ mod tests {
     use bdk_wallet::bitcoin::secp256k1::Message;
     use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache};
     use bdk_wallet::bitcoin::{
-        Address, AddressType, Amount, BlockHash, Network, OutPoint, Transaction, TxOut, Weight,
+        Address, AddressType, Amount, BlockHash, Network, OutPoint, Transaction, Weight,
         XOnlyPublicKey, absolute, psbt, taproot, transaction,
     };
     use bdk_wallet::chain::{self, BlockId};
@@ -736,16 +736,13 @@ mod tests {
             ScriptBuf::new_p2tr(&secp, xonly, Some(merkle_root))
         );
 
-        // Put a utxo paying to tr(P, tap_tree) into the wallet's graph, the way `sync_all` does,
-        // and let the wallet's own `build_tx` path (imported_utxos) prepare the PSBT input.
-        let outpoint = OutPoint::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000001:0",
-        )?;
-        let txout = TxOut {
-            value: Amount::ONE_BTC,
-            script_pubkey: imported.script_pubkey(),
-        };
-        bmp_wallet.insert_txout(outpoint, txout);
+        // Let `sync_all` hand the imported sub-wallet a utxo paying to tr(P, tap_tree), and let
+        // the wallet's own `build_tx` path (imported_utxos) prepare the PSBT input.
+        bmp_wallet.sync_all(&MockedBDKElectrum {}).await?;
+        assert_eq!(
+            bmp_wallet.imported_balance().trusted_spendable(),
+            Amount::ONE_BTC
+        );
 
         let mut tx_builder = bmp_wallet.build_tx();
 

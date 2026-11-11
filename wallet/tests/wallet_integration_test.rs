@@ -4,7 +4,7 @@ use std::str::FromStr as _;
 use base64::Engine as _;
 use bdk_kyoto::bip157::tokio;
 use bdk_kyoto::{FeeRate, TrustedPeer};
-use bdk_wallet::bitcoin::{Address, Amount, Network};
+use bdk_wallet::bitcoin::{Address, Amount, Network, OutPoint};
 use bdk_wallet::error::CreateTxError::OutputBelowDustLimit;
 use bdk_wallet::psbt::PsbtUtils as _;
 use bdk_wallet::{KeychainKind, SignOptions};
@@ -443,6 +443,97 @@ async fn test_drain_wallet_with_main_balance() -> anyhow::Result<()> {
     let main_wallet_balance = drained_amount + amount_to_send_main_wallet;
 
     assert_eq!(wallet.balance(), main_wallet_balance);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_spend_imported_output_of_known_funding_tx() -> anyhow::Result<()> {
+    // The main wallet funds a transaction paying to an external key, and that key is imported
+    // afterwards (as when the wallet funded a Deposit transaction and later imports the key
+    // controlling one of its payout outputs). The main wallet's graph then already holds the
+    // full funding transaction, so the imported output is not a floating txout there. It must
+    // still be selectable by both `build_tx` and `drain_imported_balance`.
+    let mut env = TestEnv::new()?;
+    let chain = env.new_testchain()?;
+
+    env.mine_block()?;
+
+    let mut wallet = BMPWallet::new(
+        env.new_temp_path().into(),
+        &test_password(),
+        Network::Regtest,
+    )?;
+    let addr = wallet.next_unused_address(KeychainKind::External);
+    env.fund_address(&addr, Amount::from_sat(100_000))?;
+    env.mine_block()?;
+    wallet.sync_all(&chain).await?;
+
+    let prv_key = new_private_key();
+    let imported_script = ImportedKey::new(prv_key, None)?.script_pubkey();
+    let imported_amount = Amount::from_sat(30_000);
+
+    let mut tx_builder = wallet.build_tx();
+    tx_builder.add_recipient(imported_script.clone(), imported_amount);
+    let mut psbt = tx_builder.finish()?;
+    wallet.sign(&mut psbt, SignOptions::default())?;
+    let funding_tx = psbt.extract_tx()?;
+    let funding_txid = funding_tx.compute_txid();
+    let imported_outpoint = OutPoint::new(
+        funding_txid,
+        funding_tx
+            .output
+            .iter()
+            .position(|txout| txout.script_pubkey == imported_script)
+            .expect("the funding tx pays the imported key")
+            .try_into()?,
+    );
+
+    env.broadcast(&funding_tx)?;
+    env.mine_block()?;
+    wallet.sync_all(&chain).await?;
+    assert!(
+        wallet.tx_graph().get_tx(funding_txid).is_some(),
+        "the main wallet must know the full funding transaction"
+    );
+
+    wallet.import_private_key(prv_key, None)?;
+    wallet.sync_all(&chain).await?;
+    assert_eq!(
+        wallet.imported_balance().trusted_spendable(),
+        imported_amount
+    );
+    let balance_before_drain = wallet.balance();
+
+    // Imported outputs are always spent first by `build_tx`.
+    let mut tx_builder = wallet.build_tx();
+    tx_builder.add_recipient(addr.script_pubkey(), Amount::from_sat(10_000));
+    let psbt = tx_builder.finish()?;
+    assert!(
+        psbt.unsigned_tx
+            .input
+            .iter()
+            .any(|input| input.previous_output == imported_outpoint),
+        "build_tx must select the imported output"
+    );
+
+    let mut psbt = wallet.drain_imported_balance(FeeRate::from_sat_per_vb(10).unwrap())?;
+    let spent = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .map(|input| input.previous_output)
+        .collect::<Vec<_>>();
+    assert_eq!(spent, [imported_outpoint]);
+
+    wallet.sign(&mut psbt, SignOptions::default())?;
+    let fee = psbt.fee()?;
+    env.broadcast(&psbt.extract_tx()?)?;
+    env.mine_block()?;
+    wallet.sync_all(&chain).await?;
+
+    assert_eq!(wallet.imported_balance().trusted_spendable(), Amount::ZERO);
+    assert_eq!(wallet.balance(), balance_before_drain - fee);
 
     Ok(())
 }

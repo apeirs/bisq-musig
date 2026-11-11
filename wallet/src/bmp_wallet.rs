@@ -8,8 +8,8 @@ use bdk_electrum::bdk_core::bitcoin::{Address, FeeRate, OutPoint};
 use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::hex::DisplayHex as _;
 use bdk_wallet::bitcoin::{
-    Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Transaction, Weight,
-    XOnlyPublicKey, consensus, psbt,
+    Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Transaction, TxOut,
+    Weight, XOnlyPublicKey, consensus, psbt,
 };
 use bdk_wallet::chain::{ChainPosition, Merge as _};
 use bdk_wallet::descriptor::ExtendedDescriptor;
@@ -103,6 +103,10 @@ pub struct BMPWallet {
     wallet: PersistedWallet<Connection>,
     imported_keys: HashMap<ScriptBuf, ImportedKey>,
     imported_balance: Balance,
+    /// Unspent outputs held by the imported keys, as reported by their own sub-wallets at the
+    /// last [`WalletApi::sync_all`]. These are the spend candidates for imported funds, kept in
+    /// step with `imported_balance`.
+    imported_unspent: Vec<(OutPoint, TxOut)>,
     signers_loaded: bool,
     db: BMPDatabase<Connection>,
     last_unused_address: Option<String>,
@@ -232,9 +236,15 @@ impl BMPWallet {
         &self.imported_balance
     }
 
+    /// The imported keys' unspent outputs, prepared as foreign inputs for coin selection.
+    ///
+    /// They come from the imported sub-wallets' own unspent sets rather than from the main
+    /// graph's floating txouts: when the main wallet already knows the full funding transaction
+    /// (e.g. a Deposit it funded, one of whose payouts an imported key controls), the output is
+    /// not floating there, yet it is still part of the imported balance and must be spendable.
     fn imported_utxos(&self) -> Vec<WeightedUtxo> {
-        self.tx_graph()
-            .floating_txouts()
+        self.imported_unspent
+            .iter()
             .map(|utxo| {
                 let output_script_pubkey = &utxo.1.script_pubkey;
 
@@ -611,6 +621,7 @@ impl BMPWallet {
             wallet,
             imported_keys,
             imported_balance: Balance::default(),
+            imported_unspent: Vec::new(),
             signers_loaded: false,
             db: BMPDatabase::new(storage, db),
             last_unused_address: None,
@@ -729,18 +740,21 @@ impl WalletApi for BMPWallet {
         s.sync(vec).await?;
 
         let mut final_imported_balance = Balance::default();
+        let mut final_imported_unspent = Vec::new();
 
-        // For having accurate Wallet::calculate_fee and Wallet::calculate_fee_rate
-        // This is also at same time a way to have to UTXOs of the imported merged
-        // into the main wallet, allowing easy manipulation during coinselection
+        // Record the imported UTXOs as the spend candidates for coin selection, and insert them
+        // into the main graph as txouts for accurate Wallet::calculate_fee and
+        // Wallet::calculate_fee_rate.
         for (w, _) in &imported {
             for utxo in w.list_unspent() {
-                self.insert_txout(utxo.outpoint, utxo.txout);
+                self.insert_txout(utxo.outpoint, utxo.txout.clone());
+                final_imported_unspent.push((utxo.outpoint, utxo.txout));
             }
             final_imported_balance = final_imported_balance + w.balance();
         }
 
         self.imported_balance = final_imported_balance;
+        self.imported_unspent = final_imported_unspent;
 
         // Persist changes from imported keys
         for (w, db) in &mut imported {
@@ -797,6 +811,7 @@ impl WalletApi for BMPWallet {
             wallet,
             imported_keys: HashMap::new(),
             imported_balance: Balance::default(),
+            imported_unspent: Vec::new(),
             signers_loaded: true,
             db: BMPDatabase::new(storage, db),
             last_unused_address: None,
